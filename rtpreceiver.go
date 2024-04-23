@@ -476,6 +476,8 @@ func (r *RTPReceiver) receiveForRtx(ssrc SSRC, rsid string, streamInfo *intercep
 			binary.BigEndian.PutUint32(b[8:12], uint32(track.track.SSRC()))
 			copy(b[headerLength:i-2], b[headerLength+2:i])
 
+			fmt.Println("trying to write to track.repairStreamChannel")
+
 			select {
 			case <-r.closed:
 				r.rtxPool.Put(b) // nolint:staticcheck
@@ -523,6 +525,7 @@ func (r *RTPReceiver) setRTPReadDeadline(deadline time.Time, reader *TrackRemote
 // readRTX returns an RTX packet if one is available on the RTX track, otherwise returns nil
 func (r *RTPReceiver) readRTX(reader *TrackRemote) *rtxPacketWithAttributes {
 	if !reader.HasRTX() {
+		fmt.Println("readRTX not reading from t.repairStreamChannel, reader.HasRTX == false")
 		return nil
 	}
 

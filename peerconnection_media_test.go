@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1255,10 +1256,26 @@ func TestPeerConnection_Simulcast(t *testing.T) {
 			return ridCount == 3
 		}
 
+		var rtxPacketRead atomic.Int32
+		var wg sync.WaitGroup
+		wg.Add(3)
+
 		pcAnswer.OnTrack(func(trackRemote *TrackRemote, _ *RTPReceiver) {
 			ridMapLock.Lock()
-			defer ridMapLock.Unlock()
 			ridMap[trackRemote.RID()] = ridMap[trackRemote.RID()] + 1
+			ridMapLock.Unlock()
+
+			defer wg.Done()
+
+			for {
+				pkt, _, err := trackRemote.ReadRTP()
+				if err != nil {
+					break
+				}
+				if pkt.PayloadType == 97 {
+					rtxPacketRead.Add(1)
+				}
+			}
 		})
 
 		parameters := sender.GetParameters()
@@ -1266,32 +1283,43 @@ func TestPeerConnection_Simulcast(t *testing.T) {
 		assert.Equal(t, "b", parameters.Encodings[1].RID)
 		assert.Equal(t, "c", parameters.Encodings[2].RID)
 
-		var midID, ridID uint8
+		var midID, ridID, rsid uint8
 		for _, extension := range parameters.HeaderExtensions {
 			switch extension.URI {
 			case sdp.SDESMidURI:
 				midID = uint8(extension.ID)
 			case sdp.SDESRTPStreamIDURI:
 				ridID = uint8(extension.ID)
+			case sdesRepairRTPStreamIDURI:
+				rsid = uint8(extension.ID)
 			}
 		}
 		assert.NotZero(t, midID)
 		assert.NotZero(t, ridID)
+		assert.NotZero(t, rsid)
 
-		assert.NoError(t, signalPair(pcOffer, pcAnswer))
+		err = signalPairWithModification(pcOffer, pcAnswer, func (sdp string) string {
+			// Original chrome sdp contains no ssrc info https://pastebin.com/raw/JTjX6zg6
+			re := regexp.MustCompile("(?m)[\r\n]+^.*a=ssrc.*$")
+    		res := re.ReplaceAllString(sdp, "")
+			return res
+		})
+		assert.NoError(t, err)
+
 
 		// padding only packets should not affect simulcast probe
 		var sequenceNumber uint16
 		for sequenceNumber = 0; sequenceNumber < simulcastProbeCount+10; sequenceNumber++ {
 			time.Sleep(20 * time.Millisecond)
 
-			for _, track := range []*TrackLocalStaticRTP{vp8WriterA, vp8WriterB, vp8WriterC} {
+			for i, track := range []*TrackLocalStaticRTP{vp8WriterA, vp8WriterB, vp8WriterC} {
 				pkt := &rtp.Packet{
 					Header: rtp.Header{
 						Version:        2,
 						SequenceNumber: sequenceNumber,
 						PayloadType:    96,
 						Padding:        true,
+						SSRC: uint32(i),
 					},
 					Payload: []byte{0x00, 0x02},
 				}
@@ -1304,12 +1332,13 @@ func TestPeerConnection_Simulcast(t *testing.T) {
 		for ; !ridsFullfilled(); sequenceNumber++ {
 			time.Sleep(20 * time.Millisecond)
 
-			for _, track := range []*TrackLocalStaticRTP{vp8WriterA, vp8WriterB, vp8WriterC} {
+			for i, track := range []*TrackLocalStaticRTP{vp8WriterA, vp8WriterB, vp8WriterC} {
 				pkt := &rtp.Packet{
 					Header: rtp.Header{
 						Version:        2,
 						SequenceNumber: sequenceNumber,
 						PayloadType:    96,
+						SSRC: uint32(i),
 					},
 					Payload: []byte{0x00},
 				}
@@ -1321,7 +1350,36 @@ func TestPeerConnection_Simulcast(t *testing.T) {
 		}
 
 		assertRidCorrect(t)
+
+		for i := 0; i < simulcastProbeCount+10; i++ {
+			sequenceNumber++
+			time.Sleep(10 * time.Millisecond)
+
+			for j, track := range []*TrackLocalStaticRTP{vp8WriterA, vp8WriterB, vp8WriterC} {
+				pkt := &rtp.Packet{
+					Header: rtp.Header{
+						Version:        2,
+						SequenceNumber: sequenceNumber,
+						PayloadType:    97,
+						SSRC: uint32(100 + j),
+					},
+					Payload: []byte{0x00, 0x00, 0x00, 0x00, 0x00},
+				}
+				assert.NoError(t, pkt.Header.SetExtension(midID, []byte("0")))
+				assert.NoError(t, pkt.Header.SetExtension(ridID, []byte(track.RID())))
+				assert.NoError(t, pkt.Header.SetExtension(rsid, []byte(track.RID())))
+
+				assert.NoError(t, track.WriteRTP(pkt))
+			}
+		}
+
+		time.Sleep(time.Second)
+
 		closePairNow(t, pcOffer, pcAnswer)
+
+		wg.Wait()
+
+		assert.Greater(t, rtxPacketRead.Load(), int32(0), "no rtx packet read")
 	})
 
 	t.Run("RTCP", func(t *testing.T) {
